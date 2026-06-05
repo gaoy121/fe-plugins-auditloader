@@ -17,6 +17,7 @@
 
 package com.starrocks.plugin.audit;
 
+import com.starrocks.common.Config;
 import com.starrocks.plugin.*;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -36,6 +37,7 @@ import java.nio.file.Path;
 import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
@@ -60,14 +62,20 @@ public class AuditLoaderPlugin extends Plugin implements AuditPlugin {
     private volatile boolean isInit = false;
 
     /**
-     * 是否包含新字段 candidateMvs，如果旧版本没有该字段则值为空
+     * 缓存 Field 对象，避免每次反射查找的开销
      */
-    private boolean candidateMvsExists;
-    /**
-     * 是否包含新字段 hitMVsExists，如果旧版本没有该字段则值为空
-     */
-    private boolean hitMVsExists;
+    private Map<String, Field> fieldCache;
 
+    /**
+     * 需要检验的字段
+     */
+    private String[] fieldNames = {
+            "numSlots", "bigQueryLogCPUSecondThreshold", "bigQueryLogScanBytesThreshold",
+            "bigQueryLogScanRowsThreshold", "spilledBytes", "writeClientTimeMs",
+            "warehouse", "cnGroup", "candidateMvs", "hitMVs", "features",
+            "predictMemBytes", "isForwardToLeader", "transmittedBytes", "querySource",
+            "command", "preparedStmtId"
+    };
 
     /**
      * 列分隔符
@@ -91,14 +99,34 @@ public class AuditLoaderPlugin extends Plugin implements AuditPlugin {
             loadConfig(ctx, info.getProperties());
             this.auditEventQueue = new LinkedBlockingQueue<>(conf.maxQueueSize);
             this.streamLoader = new StarrocksStreamLoader(conf);
+            this.fieldCache = new ConcurrentHashMap<>();
             this.loadThread = new Thread(new LoadWorker(this.streamLoader), "audit loader thread");
             this.loadThread.setDaemon(true);
             this.loadThread.start();
-
-            candidateMvsExists = hasField(AuditEvent.class, "candidateMvs");
-            hitMVsExists = hasField(AuditEvent.class, "hitMVs");
-
+            cacheEventField();
             isInit = true;
+        }
+    }
+
+    private void cacheEventField() {
+        for (String fieldName : fieldNames) {
+            Field field = getFieldIfExists(AuditEvent.class, fieldName);
+            if (field != null) {
+                field.setAccessible(true);
+                fieldCache.put(fieldName, field);
+            }
+        }
+        // Array字段特殊处理
+        Field queriedRelationsField = getFieldIfExists(AuditEvent.class, "queriedRelations");
+        if (queriedRelationsField != null) {
+            queriedRelationsField.setAccessible(true);
+            fieldCache.put("queriedRelations", queriedRelationsField);
+        }
+        // Config 类字段处理
+        Field auditStmtBeforeExecuteField = getFieldIfExists(Config.class, "audit_stmt_before_execute");
+        if (auditStmtBeforeExecuteField != null) {
+            auditStmtBeforeExecuteField.setAccessible(true);
+            fieldCache.put("auditStmtBeforeExecute", auditStmtBeforeExecuteField);
         }
     }
 
@@ -148,6 +176,7 @@ public class AuditLoaderPlugin extends Plugin implements AuditPlugin {
 
     public boolean eventFilter(AuditEvent.EventType type) {
         return type == AuditEvent.EventType.AFTER_QUERY ||
+                (type == AuditEvent.EventType.BEFORE_QUERY && isAuditStmtBeforeExecuteEnabled()) ||
                 type == AuditEvent.EventType.CONNECTION;
     }
 
@@ -167,6 +196,7 @@ public class AuditLoaderPlugin extends Plugin implements AuditPlugin {
         auditBuffer.append(getQueryId(queryType,event)).append(COLUMN_SEPARATOR);
         auditBuffer.append(longToTimeString(event.timestamp)).append(COLUMN_SEPARATOR);
         auditBuffer.append(queryType).append(COLUMN_SEPARATOR);
+        auditBuffer.append(getEventTypeJsonValue(event)).append(COLUMN_SEPARATOR);
         auditBuffer.append(event.clientIp).append(COLUMN_SEPARATOR);
         auditBuffer.append(event.user).append(COLUMN_SEPARATOR);
         auditBuffer.append(event.authorizedUser).append(COLUMN_SEPARATOR);
@@ -190,11 +220,11 @@ public class AuditLoaderPlugin extends Plugin implements AuditPlugin {
         auditBuffer.append(event.planMemCosts).append(COLUMN_SEPARATOR);
         auditBuffer.append(event.pendingTimeMs).append(COLUMN_SEPARATOR);
         auditBuffer.append(event.queryFeMemory).append(COLUMN_SEPARATOR);
-        String candidateMvsVal = candidateMvsExists ? event.candidateMvs : "";
-        auditBuffer.append(candidateMvsVal).append(COLUMN_SEPARATOR);
-        String hitMVsVal = hitMVsExists ? event.hitMVs : "";
-        auditBuffer.append(hitMVsVal).append(COLUMN_SEPARATOR);
-        auditBuffer.append(event.warehouse).append(ROW_DELIMITER);
+
+        Arrays.stream(fieldNames).forEach((fieldName) -> auditBuffer.append(getFieldValue(event, fieldName)).append(COLUMN_SEPARATOR));
+
+        String queriedRelationsVal = getQueriedRelationsJson(event);
+        auditBuffer.append(queriedRelationsVal).append(ROW_DELIMITER);
     }
 
     private String getQueryId(String prefix, AuditEvent event) {
@@ -236,7 +266,7 @@ public class AuditLoaderPlugin extends Plugin implements AuditPlugin {
         if (auditBuffer.length() < conf.maxBatchSize && System.currentTimeMillis() - lastLoadTime < conf.maxBatchIntervalSec * 1000) {
             return;
         }
-        if (auditBuffer.length() == 0) {
+        if (auditBuffer.isEmpty()) {
             return;
         }
 
@@ -260,14 +290,64 @@ public class AuditLoaderPlugin extends Plugin implements AuditPlugin {
      * @param fieldName
      * @return
      */
-    private boolean hasField(Class<?> clazz, String fieldName) {
-        Field[] fields = clazz.getDeclaredFields();
-        for (Field field : fields) {
-            if (field.getName().equals(fieldName)) {
-                return true;
-            }
+    private Field getFieldIfExists(Class<?> clazz, String fieldName) {
+        try {
+            return clazz.getDeclaredField(fieldName);
+        } catch (NoSuchFieldException e) {
+            return null;
         }
-        return false;
+    }
+
+    private String getFieldValue(AuditEvent event, String fieldName) {
+        try {
+            Field field = fieldCache.get(fieldName);
+            if (field == null) {
+                return null;
+            }
+            Object value = field.get(event);
+            return value != null ? value.toString() : null;
+        } catch (Exception e) {
+            LOG.debug("encounter exception when getting field value from audit event", e);
+            return null;
+        }
+    }
+
+    private String getQueriedRelationsJson(AuditEvent event) {
+        try {
+            Field queriedRelationsField = fieldCache.get("queriedRelations");
+            if (queriedRelationsField == null) {
+                return null;
+            }
+            List<String> queriedRelations = (List<String>) queriedRelationsField.get(event);
+            if (queriedRelations == null || queriedRelations.isEmpty()) {
+                return null;
+            }
+            return "[" + queriedRelations.stream()
+                    .map(relation -> "\"" + relation + "\"")
+                    .collect(Collectors.joining(",")) + "]";
+        } catch (Exception e) {
+            LOG.debug("encounter exception when getting queriedRelations from audit event", e);
+            return null;
+        }
+    }
+
+    private boolean isAuditStmtBeforeExecuteEnabled() {
+        if (!fieldCache.containsKey("auditStmtBeforeExecute")) {
+            return false;
+        }
+        try {
+            return fieldCache.get("auditStmtBeforeExecute").getBoolean(null);
+        } catch (Exception e) {
+            LOG.debug("encounter exception when getting audit_stmt_before_execute from FE config", e);
+            return false;
+        }
+    }
+
+    private String getEventTypeJsonValue(AuditEvent event) {
+        if (!isAuditStmtBeforeExecuteEnabled() || event.type == null) {
+            return "null";
+        }
+        return "\"" + event.type.name() + "\"";
     }
 
     public static class AuditLoaderConf {

@@ -5,7 +5,7 @@
 
 在 StarRocks 中，所有的审计信息仅存储在日志文件 **fe/log/fe.audit.log** 中，无法直接通过 StarRocks 进行访问。AuditLoader 插件可实现审计信息的入库，让您在 StarRocks 内方便的通过 SQL 进行集群审计信息的查看和管理。安装 AuditLoader 插件后，StarRocks 在执行 SQL 后会自动调用 AuditLoader 插件收集 SQL 的审计信息，然后将审计信息在内存中攒批，最后基于 Stream Load 的方式导入至 StarRocks 表中。
 
-**注意**：StarRocks 各个大版本的审计日志字段个数存在差异，为保证版本通用性，新版本的审计插件选取了各大版本中通用的日志字段进行入库。若业务中需要更完整的字段，可替换工程中的 `fe-plugins-auditloader\lib\starrocks-fe.jar` ，同时修改代码中与字段相关的内容后重新编译打包。
+**注意**：StarRocks 各个大版本的审计日志字段个数存在差异，为保证版本通用性，新版本的审计插件选取了各大版本中通用的日志字段进行入库。若业务中需要更完整的字段，可替换工程中的 `fe-plugins-auditloader\lib\starrocks-fe.jar`(4.x版本需要替换为fe-core.jar和fe-spi.jar) ，同时修改代码中与字段相关的内容后重新编译打包。
 
 
 
@@ -28,6 +28,7 @@ CREATE TABLE starrocks_audit_db__.starrocks_audit_tbl__ (
   `queryId` VARCHAR(64) COMMENT "查询的唯一ID",
   `timestamp` DATETIME NOT NULL COMMENT "查询开始时间",
   `queryType` VARCHAR(12) COMMENT "查询类型（query, slow_query, connection）",
+  `eventType` VARCHAR(16) NULL COMMENT "Audit event type (BEFORE_QUERY, AFTER_QUERY, CONNECTION). This field is NULL when audit_stmt_before_execute is disabled",
   `clientIp` VARCHAR(32) COMMENT "客户端IP",
   `user` VARCHAR(64) COMMENT "查询用户名",
   `authorizedUser` VARCHAR(64) COMMENT "用户唯一标识，既user_identity",
@@ -51,31 +52,33 @@ CREATE TABLE starrocks_audit_db__.starrocks_audit_tbl__ (
   `planMemCosts` DOUBLE COMMENT "查询规划阶段内存占用（字节）",
   `pendingTimeMs` BIGINT COMMENT "查询在队列中等待的时间（毫秒）",
   `queryFeMemory` BIGINT COMMENT "查询申请FE内存（字节）",
+  `numSlots` INT COMMENT "查询槽位数",
+  `bigQueryLogCPUSecondThreshold` BIGINT COMMENT "大查询日志CPU阈值（秒）",
+  `bigQueryLogScanBytesThreshold` BIGINT COMMENT "大查询日志扫描字节数阈值（字节）",
+  `bigQueryLogScanRowsThreshold` BIGINT COMMENT "大查询日志扫描行数阈值（行）",
+  `spilledBytes` BIGINT COMMENT "查询落盘数据量（字节）",
+  `writeClientTimeMs` BIGINT COMMENT "查询写入客户端时间（毫秒）",
+  `warehouse` VARCHAR(32) NULL COMMENT "仓库名称",
+  `cnGroup` VARCHAR(256) NULL COMMENT "CN组名称",
   `candidateMVs` VARCHAR(65533) NULL COMMENT "候选MV列表",
   `hitMvs` VARCHAR(65533) NULL COMMENT "命中MV列表",
-  `warehouse` VARCHAR(32) NULL COMMENT "warehouse name"
+  `features` VARCHAR(65533) NULL COMMENT "features",
+  `predictMemBytes` BIGINT COMMENT "查询预测内存使用（字节）",
+  `isForwardToLeader` BOOLEAN COMMENT "查询是否转发到Leader",
+  `transmittedBytes` BIGINT COMMENT "查询传输字节数（字节）",
+  `querySource` VARCHAR(64) NULL COMMENT "查询来源",
+  `command` VARCHAR(256) NULL COMMENT "查询命令",
+  `preparedStmtId` VARCHAR(128) NULL COMMENT "预处理语句ID",
+  `queriedRelations` ARRAY<VARCHAR(65533)> NULL COMMENT "查询直接访问的表、视图"
 ) ENGINE = OLAP
 DUPLICATE KEY (`queryId`, `timestamp`, `queryType`)
 COMMENT "审计日志表"
-PARTITION BY RANGE (`timestamp`) ()
-DISTRIBUTED BY HASH (`queryId`) BUCKETS 3 
+PARTITION BY date_trunc('day', `timestamp`)
 PROPERTIES (
-  "dynamic_partition.time_unit" = "DAY",
-  "dynamic_partition.start" = "-30",  --表示只保留最近30天的审计信息，可视需求调整
-  "dynamic_partition.end" = "3",
-  "dynamic_partition.prefix" = "p",
-  "dynamic_partition.buckets" = "3",
-  "dynamic_partition.enable" = "true",
-  "replication_num" = "3"  --若集群中BE个数不大于3，可调整副本数为1，生产集群不推荐调整
+  "replication_num" = "1",  --若集群中BE个数不大于3，可调整副本数为1，生产集群不推荐调整
+  "partition_live_number"="30"  --表示只保留最近30天的审计信息，可视需求调整
 );
 ```
-
-**注意**：为便于对审计信息进行TTL（Time to Live）生命周期管理，通常推荐将表 `starrocks_audit_tbl__` 创建为动态分区表，上文的建表语句中没有显示的创建分区，所以建表后需要等待后台动态分区调度线程调度后才会生成当天及后三天的分区。动态分区调度进程默认 10 分钟调度一次（fe.conf  dynamic_partition_check_interval_seconds），您可以先观察分区是否已经被创建，再进行后续操作，分区查看命令为：
-
-```SQL
-show partitions from starrocks_audit_db__.starrocks_audit_tbl__;
-```
-
 
 
 ##### 2、修改配置文件
@@ -211,8 +214,8 @@ JavaVersion: 1.8.31
        Name: AuditLoader
        Type: AUDIT
 Description: Available for versions 3.3.11+. Load audit log to starrocks, and user can view the statistic of queries
-    Version: 5.0.0
-JavaVersion: 11
+    Version: 6.0.0
+JavaVersion: 17
   ClassName: com.starrocks.plugin.audit.AuditLoaderPlugin
      SoName: NULL
     Sources: /opt/module/starrocks/auditloader.zip
@@ -267,3 +270,22 @@ StarRocks审计表中支持的 `queryType` 类型包括：query、slow_query 和
 
 对于 connection，StarRocks 3.0.6+ 版本支持在 fe.audit.log 中打印客户端连接时成功/失败的 connection 信息，您可以在 `fe.conf` 里配置 `audit_log_modules=slow_query,query,connection`，然后重启 FE 来进行启用。在启用 connection 信息后，AuditLoader 插件同样能采集到这类客户端连接信息并入库到表 `starrocks_audit_tbl__` 中，入库后该类信息对应的审计表的 `queryType` 字段即为 connection，您可以以此进行用户登录信息的审计。
 
+对于支持 `audit_stmt_before_execute` 的 StarRocks 版本，AuditLoader 插件会自动检测FE配置是否已启用。如果此配置已禁用或当前前端版本不支持，则 `eventType` 字段将被加载为 `NULL`，查询语句仍然只会生成常规的执行后审计记录。启用 `audit_stmt_before_execute` 后，AuditLoader 还会收集执行前审计事件。您可以使用 `eventType` 来区分 `BEFORE_QUERY`、`AFTER_QUERY` 和 `CONNECTION` 记录。
+
+如果您是从早期版本的 AuditLoader 表升级，请在安装新插件包之前添加可空字段：
+```sql
+ALTER TABLE starrocks_audit_db__.starrocks_audit_tbl__
+ADD COLUMN `eventType` VARCHAR(16) NULL COMMENT "Audit event type (BEFORE_QUERY, AFTER_QUERY, CONNECTION). This field is NULL when audit_stmt_before_execute is disabled";
+```
+
+### Release Notes:
+
+##### AuditLoader  v4.2.2
+
+1. 新增了 `eventType` 字段。仅当FE配置 `audit_stmt_before_execute` 启用时，该字段才会被填充；否则，该字段的值将为 `NULL`。
+
+2. 当 `audit_stmt_before_execute` 启用时，新增了 `BEFORE_QUERY` 审计事件集合，从而可以在审计表中区分执行前和执行后的审计记录。
+
+##### AuditLoader  v4.2.1
+
+1. 新增了在 plugin.conf 中配置加密密码的功能。

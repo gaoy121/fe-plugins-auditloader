@@ -82,7 +82,10 @@ public class StarrocksStreamLoader {
         conn.addRequestProperty("column_separator", String.valueOf(AuditLoaderPlugin.COLUMN_SEPARATOR));
         conn.addRequestProperty("row_delimiter", String.valueOf(AuditLoaderPlugin.ROW_DELIMITER));
 
-        conn.addRequestProperty("columns", "queryId,timestamp,queryType,clientIp,user,authorizedUser,resourceGroup,catalog,db,state,errorCode,queryTime,scanBytes,scanRows,returnRows,cpuCostNs,memCostBytes,stmtId,isQuery,feIp,stmt,digest,planCpuCosts,planMemCosts,pendingTimeMs,queryFeMemory,candidateMVs,hitMvs,warehouse");
+        conn.addRequestProperty("columns", "queryId,timestamp,queryType,eventType,clientIp,user,authorizedUser,resourceGroup,catalog,db,state,errorCode," +
+                "queryTime,scanBytes,scanRows,returnRows,cpuCostNs,memCostBytes,stmtId,isQuery,feIp,stmt,digest,planCpuCosts,planMemCosts,pendingTimeMs,queryFeMemory," +
+                "numSlots,bigQueryLogCPUSecondThreshold,bigQueryLogScanBytesThreshold,bigQueryLogScanRowsThreshold,spilledBytes,writeClientTimeMs,warehouse,cnGroup," +
+                "candidateMVs,hitMvs,features,predictMemBytes,isForwardToLeader,transmittedBytes,querySource,command,preparedStmtId,queriedRelations");
         if(!StringUtils.isBlank(this.streamLoadFilter)) {
             conn.addRequestProperty("where", streamLoadFilter);
         }
@@ -105,8 +108,10 @@ public class StarrocksStreamLoader {
         if(!StringUtils.isBlank(this.streamLoadFilter)) {
             sb.append("-H \"").append("where\":").append(streamLoadFilter).append(" \\\n  ");
         }
-        sb.append("-H \"").append("columns\":").append("\"queryId, timestamp, queryType, clientIp, user, authorizedUser, resourceGroup, catalog, db, state, errorCode," +
-                "queryTime, scanBytes, scanRows, returnRows, cpuCostNs, memCostBytes, stmtId, isQuery, feIp, stmt, digest, planCpuCosts, planMemCosts, pendingTimeMs, queryFeMemory, candidateMVs, hitMvs, warehouse\" \\\n  ");
+        sb.append("-H \"").append("columns\":").append("\"queryId, timestamp, queryType, eventType, clientIp, user, authorizedUser, resourceGroup, catalog, db, state, errorCode," +
+                "queryTime, scanBytes, scanRows, returnRows, cpuCostNs, memCostBytes, stmtId, isQuery, feIp, stmt, digest, planCpuCosts, planMemCosts, pendingTimeMs, queryFeMemory, " +
+                "numSlots, bigQueryLogCPUSecondThreshold, bigQueryLogScanBytesThreshold, bigQueryLogScanRowsThreshold, spilledBytes, writeClientTimeMs, warehouse, cnGroup, " +
+                "candidateMVs, hitMvs, features, predictMemBytes, isForwardToLeader, transmittedBytes, querySource, command, preparedStmtId, queriedRelations\" \\\n  ");
         sb.append("\"").append(conn.getURL()).append("\"");
         return sb.toString();
     }
